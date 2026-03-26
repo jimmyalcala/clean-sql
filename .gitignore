@@ -1,0 +1,22 @@
+# Binary
+clean-sql
+*.exe
+
+# Build output
+build/
+
+# Go
+*.test
+*.out
+*.prof
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

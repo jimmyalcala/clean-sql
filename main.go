@@ -1,0 +1,438 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+const version = "1.0.0"
+
+// MySQL/MariaDB reserved words that commonly appear as column names.
+// Source: https://dev.mysql.com/doc/refman/8.0/en/keywords.html
+var reservedWords = map[string]bool{
+	"accessible": true, "add": true, "all": true, "alter": true, "analyze": true,
+	"and": true, "as": true, "asc": true, "asensitive": true, "before": true,
+	"between": true, "bigint": true, "binary": true, "blob": true, "both": true,
+	"by": true, "call": true, "cascade": true, "case": true, "change": true,
+	"char": true, "character": true, "check": true, "collate": true, "column": true,
+	"condition": true, "constraint": true, "continue": true, "convert": true,
+	"create": true, "cross": true, "current_date": true, "current_time": true,
+	"current_timestamp": true, "current_user": true, "cursor": true, "database": true,
+	"databases": true, "day_hour": true, "day_microsecond": true, "day_minute": true,
+	"day_second": true, "dec": true, "decimal": true, "declare": true, "default": true,
+	"delayed": true, "delete": true, "desc": true, "describe": true, "deterministic": true,
+	"distinct": true, "distinctrow": true, "div": true, "double": true, "drop": true,
+	"dual": true, "each": true, "else": true, "elseif": true, "enclosed": true,
+	"escaped": true, "exists": true, "exit": true, "explain": true, "false": true,
+	"fetch": true, "float": true, "float4": true, "float8": true, "for": true,
+	"force": true, "foreign": true, "from": true, "fulltext": true, "generated": true,
+	"get": true, "grant": true, "group": true, "having": true, "high_priority": true,
+	"hour_microsecond": true, "hour_minute": true, "hour_second": true, "if": true,
+	"ignore": true, "in": true, "index": true, "infile": true, "inner": true,
+	"inout": true, "insensitive": true, "insert": true, "int": true, "int1": true,
+	"int2": true, "int3": true, "int4": true, "int8": true, "integer": true,
+	"interval": true, "into": true, "io_after_gtids": true, "io_before_gtids": true,
+	"is": true, "iterate": true, "join": true, "key": true, "keys": true,
+	"kill": true, "leading": true, "leave": true, "left": true, "like": true,
+	"limit": true, "linear": true, "lines": true, "load": true, "localtime": true,
+	"localtimestamp": true, "lock": true, "long": true, "longblob": true,
+	"longtext": true, "loop": true, "low_priority": true, "master_bind": true,
+	"master_ssl_verify_server_cert": true, "match": true, "maxvalue": true,
+	"mediumblob": true, "mediumint": true, "mediumtext": true, "middleint": true,
+	"minute_microsecond": true, "minute_second": true, "mod": true, "modifies": true,
+	"natural": true, "not": true, "no_write_to_binlog": true, "null": true,
+	"numeric": true, "on": true, "optimize": true, "option": true, "optionally": true,
+	"or": true, "order": true, "out": true, "outer": true, "outfile": true,
+	"partition": true, "precision": true, "primary": true, "procedure": true,
+	"purge": true, "range": true, "read": true, "reads": true, "read_write": true,
+	"real": true, "references": true, "regexp": true, "release": true, "rename": true,
+	"repeat": true, "replace": true, "require": true, "resignal": true, "restrict": true,
+	"return": true, "revoke": true, "right": true, "rlike": true, "schema": true,
+	"schemas": true, "second_microsecond": true, "select": true, "sensitive": true,
+	"separator": true, "set": true, "show": true, "signal": true, "smallint": true,
+	"spatial": true, "specific": true, "sql": true, "sqlexception": true,
+	"sqlstate": true, "sqlwarning": true, "sql_big_result": true,
+	"sql_calc_found_rows": true, "sql_small_result": true, "ssl": true,
+	"starting": true, "stored": true, "straight_join": true, "table": true,
+	"terminated": true, "then": true, "tinyblob": true, "tinyint": true,
+	"tinytext": true, "to": true, "trailing": true, "trigger": true, "true": true,
+	"undo": true, "union": true, "unique": true, "unlock": true, "unsigned": true,
+	"update": true, "usage": true, "use": true, "using": true, "utc_date": true,
+	"utc_time": true, "utc_timestamp": true, "values": true, "varbinary": true,
+	"varchar": true, "varcharacter": true, "varying": true, "virtual": true,
+	"when": true, "where": true, "while": true, "with": true, "write": true,
+	"xor": true, "year_month": true, "zerofill": true,
+	// MariaDB additional reserved words
+	"action": true, "bit": true, "date": true, "enum": true, "no": true,
+	"text": true, "time": true, "timestamp": true, "year": true,
+	// MySQL 8.0+ reserved words that are common column names
+	"rank": true, "row": true, "rows": true, "groups": true, "system": true,
+	"function": true, "window": true, "over": true, "recursive": true,
+}
+
+func isReserved(word string) bool {
+	return reservedWords[strings.ToLower(word)]
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '_'
+}
+
+// processSQL reads the entire SQL stream character-by-character using a state
+// machine. It tracks whether we are inside a single-quoted string literal
+// (across line boundaries) and fixes reserved-word column names in INSERT...SET
+// assignment lists.
+//
+// State machine:
+//   - NORMAL: outside any string/statement context we care about
+//   - IN_STRING: inside a single-quoted SQL string literal
+//   - EXPECT_COL: after a comma outside a string in a SET clause, expecting a column name
+//
+// The key insight: in INSERT...SET syntax, after the SET keyword and after each
+// value's closing quote/NULL/number followed by a comma, the next identifier
+// before '=' is always a column name. We detect " SET " outside strings to enter
+// column-tracking mode, and track commas outside strings to find column names.
+func processSQL(reader io.Reader, writer io.Writer) (int, error) {
+	br := bufio.NewReaderSize(reader, 256*1024)
+	bw := bufio.NewWriterSize(writer, 256*1024)
+	defer bw.Flush()
+
+	fixCount := 0
+
+	// State
+	inString := false     // inside a single-quoted string
+	inSetClause := false  // inside a SET column=value list
+	expectCol := false    // next identifier should be treated as a column name
+	afterComma := false   // just saw a comma outside a string in SET context
+
+	// Buffer for accumulating potential identifiers
+	var identBuf []byte
+
+	flushIdent := func(nextByte byte) {
+		if len(identBuf) == 0 {
+			return
+		}
+		word := string(identBuf)
+		identBuf = identBuf[:0]
+
+		// Check if this identifier is followed by '=' — meaning it's a column name
+		if nextByte == '=' && inSetClause && expectCol {
+			if isReserved(word) {
+				bw.WriteByte('`')
+				bw.WriteString(word)
+				bw.WriteByte('`')
+				fixCount++
+				return
+			}
+		}
+
+		// Check if this is the SET keyword (outside strings)
+		if !inString && strings.EqualFold(word, "SET") {
+			// We only care about SET in INSERT context.
+			// A simple heuristic: if we see SET, start tracking columns.
+			inSetClause = true
+			expectCol = true
+		}
+
+		bw.WriteString(word)
+	}
+
+	// Ringbuffer to detect INSERT keyword for context
+	// We'll use a simpler approach: track SET keyword outside strings
+
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			flushIdent(0)
+			if err == io.EOF {
+				return fixCount, nil
+			}
+			return fixCount, err
+		}
+
+		if inString {
+			// Inside a single-quoted string literal
+			if len(identBuf) > 0 {
+				// Shouldn't happen, but flush just in case
+				bw.Write(identBuf)
+				identBuf = identBuf[:0]
+			}
+
+			if b == '\\' {
+				// Escaped character — write backslash and next char
+				bw.WriteByte(b)
+				next, err := br.ReadByte()
+				if err != nil {
+					if err == io.EOF {
+						return fixCount, nil
+					}
+					return fixCount, err
+				}
+				bw.WriteByte(next)
+			} else if b == '\'' {
+				// Could be end of string or '' escape
+				bw.WriteByte(b)
+				next, err := br.ReadByte()
+				if err != nil {
+					inString = false
+					if err == io.EOF {
+						return fixCount, nil
+					}
+					return fixCount, err
+				}
+				if next == '\'' {
+					// '' escape — still in string
+					bw.WriteByte(next)
+				} else {
+					// End of string
+					inString = false
+					// Put back the byte we peeked
+					br.UnreadByte()
+				}
+			} else {
+				bw.WriteByte(b)
+			}
+			continue
+		}
+
+		// Outside a string literal
+		if isIdentChar(b) {
+			identBuf = append(identBuf, b)
+			continue
+		}
+
+		// Non-identifier character — flush any accumulated identifier
+		flushIdent(b)
+
+		switch b {
+		case '\'':
+			inString = true
+			expectCol = false
+			afterComma = false
+			bw.WriteByte(b)
+
+		case '=':
+			// After writing column name (handled in flushIdent)
+			bw.WriteByte(b)
+			expectCol = false
+
+		case ',':
+			bw.WriteByte(b)
+			if inSetClause {
+				afterComma = true
+				expectCol = true
+			}
+
+		case ';':
+			// End of statement — reset state
+			bw.WriteByte(b)
+			inSetClause = false
+			expectCol = false
+			afterComma = false
+
+		case '`':
+			// Backtick-quoted identifier — copy through unchanged
+			bw.WriteByte(b)
+			for {
+				next, err := br.ReadByte()
+				if err != nil {
+					if err == io.EOF {
+						return fixCount, nil
+					}
+					return fixCount, err
+				}
+				bw.WriteByte(next)
+				if next == '`' {
+					break
+				}
+			}
+
+		default:
+			_ = afterComma
+			bw.WriteByte(b)
+		}
+	}
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `clean-sql v%s — Fix MySQL/MariaDB SQL dump files
+
+Backtick-quotes reserved words used as column names in INSERT...SET statements,
+which commonly cause ERROR 1064 syntax errors during import.
+
+Usage:
+  clean-sql <input.sql>                  Fix and write to <input>_clean.sql
+  clean-sql <input.sql> -o <output.sql>  Fix and write to specified output
+  clean-sql <input.sql> -i               Fix the file in-place
+  clean-sql --check <input.sql>          Check only, report issues (no changes)
+
+Options:
+  -o <file>    Output file path
+  -i           Edit file in-place (overwrites original)
+  --check      Dry run: report number of fixes needed without writing
+  --version    Show version
+  -h, --help   Show this help
+
+Examples:
+  clean-sql db-backup.sql
+  clean-sql db-backup.sql -i
+  clean-sql db-backup.sql -o fixed.sql
+  cat dump.sql | clean-sql - > fixed.sql
+`, version)
+}
+
+func main() {
+	args := os.Args[1:]
+
+	if len(args) == 0 {
+		usage()
+		os.Exit(1)
+	}
+
+	var inputFile string
+	var outputFile string
+	var inPlace bool
+	var checkOnly bool
+
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "-h", "--help":
+			usage()
+			os.Exit(0)
+		case "--version":
+			fmt.Printf("clean-sql v%s\n", version)
+			os.Exit(0)
+		case "-o":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: -o requires an output file path")
+				os.Exit(1)
+			}
+			i++
+			outputFile = args[i]
+		case "-i":
+			inPlace = true
+		case "--check":
+			checkOnly = true
+		default:
+			if inputFile == "" {
+				inputFile = args[i]
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: unexpected argument: %s\n", args[i])
+				os.Exit(1)
+			}
+		}
+		i++
+	}
+
+	if inputFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: no input file specified")
+		os.Exit(1)
+	}
+
+	// Handle stdin
+	if inputFile == "-" {
+		fixCount, err := processSQL(os.Stdin, os.Stdout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Fixed %d reserved word column names\n", fixCount)
+		os.Exit(0)
+	}
+
+	// Determine output path
+	if inPlace {
+		outputFile = inputFile
+	} else if outputFile == "" && !checkOnly {
+		ext := ""
+		base := inputFile
+		if idx := strings.LastIndex(inputFile, "."); idx >= 0 {
+			ext = inputFile[idx:]
+			base = inputFile[:idx]
+		}
+		outputFile = base + "_clean" + ext
+	}
+
+	// Open input
+	inFile, err := os.Open(inputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening input: %v\n", err)
+		os.Exit(1)
+	}
+	defer inFile.Close()
+
+	if checkOnly {
+		fixCount, err := processSQL(inFile, io.Discard)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if fixCount == 0 {
+			fmt.Println("No reserved word issues found.")
+		} else {
+			fmt.Printf("Found %d reserved word column names that need quoting.\n", fixCount)
+		}
+		os.Exit(0)
+	}
+
+	// For in-place, write to temp file then rename
+	var outFile *os.File
+	if inPlace {
+		outFile, err = os.CreateTemp("", "clean-sql-*.sql")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating temp file: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.Remove(outFile.Name())
+	} else {
+		outFile, err = os.Create(outputFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating output: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fixCount, err := processSQL(inFile, outFile)
+	outFile.Close()
+	inFile.Close()
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error processing: %v\n", err)
+		os.Exit(1)
+	}
+
+	if inPlace {
+		if err := copyFile(outFile.Name(), inputFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing in-place: %v\n", err)
+			os.Exit(1)
+		}
+		os.Remove(outFile.Name())
+	}
+
+	fmt.Fprintf(os.Stderr, "Fixed %d reserved word column names\n", fixCount)
+	if !inPlace {
+		fmt.Fprintf(os.Stderr, "Output written to: %s\n", outputFile)
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
+}
