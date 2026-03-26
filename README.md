@@ -1,6 +1,6 @@
 # clean-sql
 
-Fix MySQL/MariaDB SQL dump files that fail to import with **ERROR 1064** caused by reserved words used as unquoted column names in `INSERT...SET` statements.
+Fix MySQL/MariaDB SQL dump files that fail to import with **ERROR 1064** (reserved words as column names) and **ERROR 1451** (foreign key constraints) during restore.
 
 ## The Problem
 
@@ -26,6 +26,17 @@ INSERT IGNORE INTO email_custom SET id='1',subject='Hello',body='<html>...</html
 ```
 
 But doing this manually on a 300,000-line dump file with HTML email templates spanning multiple lines? No thanks.
+
+On top of that, imports often fail with **ERROR 1451** when `DELETE` or `UPDATE` statements hit foreign key constraints:
+
+```
+ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key
+constraint fails (`io`.`inoff_phonenumbers`, CONSTRAINT `phonenumber_greetingid`
+FOREIGN KEY (`phonenumber_greetingid`) REFERENCES `inoff_phonerecordings`
+(`phonerecording_id`) ON DELETE NO ACTION ON UPDATE NO ACTION)
+```
+
+`clean-sql` handles both problems.
 
 ## Why I Made This
 
@@ -74,11 +85,17 @@ clean-sql db-backup.sql -o fixed.sql
 # Fix the file in-place (overwrites original)
 clean-sql db-backup.sql -i
 
+# Disable foreign key checks during import (fixes ERROR 1451)
+clean-sql db-backup.sql --disable-fk
+
 # Dry run — just report how many issues found
 clean-sql --check db-backup.sql
 
 # Read from stdin, write to stdout
 cat dump.sql | clean-sql - > fixed.sql
+
+# Self-update to the latest version
+clean-sql --update
 ```
 
 ### Options
@@ -87,7 +104,9 @@ cat dump.sql | clean-sql - > fixed.sql
 |------|-------------|
 | `-o <file>` | Output file path |
 | `-i` | Edit file in-place (overwrites original) |
+| `--disable-fk` | Wrap output with `SET FOREIGN_KEY_CHECKS=0/1` to prevent foreign key errors |
 | `--check` | Dry run: report number of fixes needed without writing |
+| `--update` | Self-update to the latest release from GitHub |
 | `--version` | Show version |
 | `-h, --help` | Show help |
 
@@ -98,8 +117,8 @@ cat dump.sql | clean-sql - > fixed.sql
 clean-sql --check db-backup-mysite-1774532776.sql
 # Found 40 reserved word column names that need quoting.
 
-# Fix the file
-clean-sql db-backup-mysite-1774532776.sql
+# Fix reserved words + disable foreign key checks
+clean-sql db-backup-mysite-1774532776.sql --disable-fk
 # Fixed 40 reserved word column names
 # Output written to: db-backup-mysite-1774532776_clean.sql
 
@@ -107,6 +126,18 @@ clean-sql db-backup-mysite-1774532776.sql
 mysql -hlocalhost -uuser -ppassword mydb < db-backup-mysite-1774532776_clean.sql
 # Success — 0 errors
 ```
+
+### Updating
+
+```bash
+clean-sql --update
+# Checking for updates...
+# Updating v1.0.0 -> v1.1.0
+# Downloading clean-sql-darwin-arm64...
+# Updated to v1.1.0
+```
+
+The `--update` flag checks GitHub for the latest release, downloads the correct binary for your OS/architecture, and replaces the current binary automatically.
 
 ## How It Works
 
@@ -123,6 +154,16 @@ This means it correctly handles:
 - `from=` appearing inside string content (not touched)
 - Already backtick-quoted identifiers (not double-quoted)
 - Multiple statements in sequence
+
+With `--disable-fk`, it also wraps the entire output with:
+
+```sql
+SET FOREIGN_KEY_CHECKS=0;
+-- ... your SQL statements ...
+SET FOREIGN_KEY_CHECKS=1;
+```
+
+This prevents foreign key constraint errors (ERROR 1451) when `DELETE` or `UPDATE` statements reference rows in child tables.
 
 ## Reporting Issues
 
