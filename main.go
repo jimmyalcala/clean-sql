@@ -2,13 +2,119 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 )
 
-const version = "1.0.0"
+const (
+	version = "1.1.0"
+	repo    = "jimmyalcala/clean-sql"
+)
+
+type ghRelease struct {
+	TagName string    `json:"tag_name"`
+	Assets  []ghAsset `json:"assets"`
+}
+
+type ghAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+func selfUpdate() {
+	fmt.Println("Checking for updates...")
+
+	resp, err := http.Get("https://api.github.com/repos/" + repo + "/releases/latest")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var release ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing release info: %v\n", err)
+		os.Exit(1)
+	}
+
+	latest := strings.TrimPrefix(release.TagName, "v")
+	if latest == version {
+		fmt.Printf("Already up to date (v%s)\n", version)
+		return
+	}
+
+	fmt.Printf("Updating v%s -> v%s\n", version, latest)
+
+	// Find the right binary for this OS/arch
+	assetName := fmt.Sprintf("clean-sql-%s-%s", runtime.GOOS, runtime.GOARCH)
+	var downloadURL string
+	for _, asset := range release.Assets {
+		if asset.Name == assetName {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+
+	if downloadURL == "" {
+		fmt.Fprintf(os.Stderr, "No binary found for %s/%s\n", runtime.GOOS, runtime.GOARCH)
+		os.Exit(1)
+	}
+
+	// Download to temp file
+	fmt.Printf("Downloading %s...\n", assetName)
+	dlResp, err := http.Get(downloadURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error downloading: %v\n", err)
+		os.Exit(1)
+	}
+	defer dlResp.Body.Close()
+
+	tmpFile, err := os.CreateTemp("", "clean-sql-update-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating temp file: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := io.Copy(tmpFile, dlResp.Body); err != nil {
+		fmt.Fprintf(os.Stderr, "Error downloading: %v\n", err)
+		os.Exit(1)
+	}
+	tmpFile.Close()
+
+	if err := os.Chmod(tmpFile.Name(), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting permissions: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Find where the current binary lives
+	execPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error finding executable path: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Try direct replace first, fall back to sudo
+	if err := copyFile(tmpFile.Name(), execPath); err != nil {
+		fmt.Println("Need sudo to replace binary...")
+		cmd := exec.Command("sudo", "cp", tmpFile.Name(), execPath)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error replacing binary: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("Updated to v%s\n", latest)
+}
 
 // MySQL/MariaDB reserved words that commonly appear as column names.
 // Source: https://dev.mysql.com/doc/refman/8.0/en/keywords.html
@@ -282,6 +388,7 @@ Options:
   -i             Edit file in-place (overwrites original)
   --disable-fk   Wrap output with SET FOREIGN_KEY_CHECKS=0/1
   --check        Dry run: report number of fixes needed without writing
+  --update       Self-update to the latest release
   --version      Show version
   -h, --help     Show this help
 
@@ -315,6 +422,9 @@ func main() {
 			os.Exit(0)
 		case "--version":
 			fmt.Printf("clean-sql v%s\n", version)
+			os.Exit(0)
+		case "--update":
+			selfUpdate()
 			os.Exit(0)
 		case "-o":
 			if i+1 >= len(args) {
