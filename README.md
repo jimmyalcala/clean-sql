@@ -1,10 +1,19 @@
 # clean-sql
 
-Fix MySQL/MariaDB SQL dump files that fail to import with **ERROR 1064** (reserved words as column names) and **ERROR 1451** (foreign key constraints) during restore.
+Automatically fix errors when restoring MySQL/MariaDB SQL dump files. No more manually editing massive SQL files — just run `clean-sql` and import cleanly.
+
+## Errors Resolved
+
+| Error | Code | Cause | Fix Applied |
+|-------|------|-------|-------------|
+| `You have an error in your SQL syntax` | ERROR 1064 (42000) | Reserved words (`from`, `key`, `order`, etc.) used as unquoted column names in `INSERT...SET` | Backtick-quotes the reserved word column names |
+| `Cannot delete or update a parent row: a foreign key constraint fails` | ERROR 1451 (23000) | `DELETE`/`UPDATE` blocked by foreign key references in child tables | Wraps SQL with `SET FOREIGN_KEY_CHECKS=0/1` (`--disable-fk`) |
+
+Have an error not listed here? [Open an issue](https://github.com/jimmyalcala/clean-sql/issues) and we'll add support for it.
 
 ## The Problem
 
-Many backup systems generate SQL dumps using `INSERT...SET` syntax where column names are not backtick-quoted. When a column name happens to be a MySQL/MariaDB reserved word (like `from`, `key`, `order`, `group`, etc.), the import fails:
+Backup systems often generate SQL dumps with syntax that breaks on import. The most common issue: column names that are MySQL reserved words aren't backtick-quoted.
 
 ```
 ERROR 1064 (42000) at line 1519: You have an error in your SQL syntax;
@@ -12,20 +21,18 @@ check the manual that corresponds to your MariaDB server version for the
 right syntax to use near 'from=NULL,attachments=NULL,...' at line 1
 ```
 
-The offending SQL looks like this:
+The offending SQL:
 
 ```sql
 INSERT IGNORE INTO email_custom SET id='1',subject='Hello',body='<html>...</html>',from=NULL,attachments=NULL;
 --                                                                                  ^^^^ reserved word!
 ```
 
-The fix is simple — backtick-quote the column name:
+`clean-sql` fixes it automatically:
 
 ```sql
 INSERT IGNORE INTO email_custom SET id='1',subject='Hello',body='<html>...</html>',`from`=NULL,attachments=NULL;
 ```
-
-But doing this manually on a 300,000-line dump file with HTML email templates spanning multiple lines? No thanks.
 
 On top of that, imports often fail with **ERROR 1451** when `DELETE` or `UPDATE` statements hit foreign key constraints:
 
@@ -36,7 +43,7 @@ FOREIGN KEY (`phonenumber_greetingid`) REFERENCES `inoff_phonerecordings`
 (`phonerecording_id`) ON DELETE NO ACTION ON UPDATE NO ACTION)
 ```
 
-`clean-sql` handles both problems.
+Doing this manually on a 300,000-line dump file with HTML email templates spanning multiple lines? No thanks. `clean-sql` handles it all.
 
 ## Why I Made This
 
