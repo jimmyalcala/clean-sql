@@ -27,7 +27,7 @@ fi
 
 # Step 1: Clean
 echo "==> Cleaning SQL file..."
-clean-sql "$FILE" -o "$CLEAN_FILE"
+clean-sql "$FILE" --disable-fk -o "$CLEAN_FILE"
 
 # Step 2: Import
 echo "==> Importing into MySQL..."

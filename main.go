@@ -96,10 +96,14 @@ func isIdentChar(b byte) bool {
 // value's closing quote/NULL/number followed by a comma, the next identifier
 // before '=' is always a column name. We detect " SET " outside strings to enter
 // column-tracking mode, and track commas outside strings to find column names.
-func processSQL(reader io.Reader, writer io.Writer) (int, error) {
+func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error) {
 	br := bufio.NewReaderSize(reader, 256*1024)
 	bw := bufio.NewWriterSize(writer, 256*1024)
 	defer bw.Flush()
+
+	if disableFK {
+		bw.WriteString("SET FOREIGN_KEY_CHECKS=0;\n")
+	}
 
 	fixCount := 0
 
@@ -149,6 +153,9 @@ func processSQL(reader io.Reader, writer io.Writer) (int, error) {
 		if err != nil {
 			flushIdent(0)
 			if err == io.EOF {
+				if disableFK {
+					bw.WriteString("\nSET FOREIGN_KEY_CHECKS=1;\n")
+				}
 				return fixCount, nil
 			}
 			return fixCount, err
@@ -271,11 +278,12 @@ Usage:
   clean-sql --check <input.sql>          Check only, report issues (no changes)
 
 Options:
-  -o <file>    Output file path
-  -i           Edit file in-place (overwrites original)
-  --check      Dry run: report number of fixes needed without writing
-  --version    Show version
-  -h, --help   Show this help
+  -o <file>      Output file path
+  -i             Edit file in-place (overwrites original)
+  --disable-fk   Wrap output with SET FOREIGN_KEY_CHECKS=0/1
+  --check        Dry run: report number of fixes needed without writing
+  --version      Show version
+  -h, --help     Show this help
 
 Examples:
   clean-sql db-backup.sql
@@ -297,6 +305,7 @@ func main() {
 	var outputFile string
 	var inPlace bool
 	var checkOnly bool
+	var disableFK bool
 
 	i := 0
 	for i < len(args) {
@@ -318,6 +327,8 @@ func main() {
 			inPlace = true
 		case "--check":
 			checkOnly = true
+		case "--disable-fk":
+			disableFK = true
 		default:
 			if inputFile == "" {
 				inputFile = args[i]
@@ -336,7 +347,7 @@ func main() {
 
 	// Handle stdin
 	if inputFile == "-" {
-		fixCount, err := processSQL(os.Stdin, os.Stdout)
+		fixCount, err := processSQL(os.Stdin, os.Stdout, disableFK)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -367,7 +378,7 @@ func main() {
 	defer inFile.Close()
 
 	if checkOnly {
-		fixCount, err := processSQL(inFile, io.Discard)
+		fixCount, err := processSQL(inFile, io.Discard, false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -397,7 +408,7 @@ func main() {
 		}
 	}
 
-	fixCount, err := processSQL(inFile, outFile)
+	fixCount, err := processSQL(inFile, outFile, disableFK)
 	outFile.Close()
 	inFile.Close()
 

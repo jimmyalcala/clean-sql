@@ -10,7 +10,7 @@ func runProcess(t *testing.T, input string) (string, int) {
 	t.Helper()
 	reader := strings.NewReader(input)
 	var buf bytes.Buffer
-	count, err := processSQL(reader, &buf)
+	count, err := processSQL(reader, &buf, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +173,27 @@ func TestDoubleQuoteEscape(t *testing.T) {
 
 	if !strings.Contains(result, "`from`=NULL") {
 		t.Errorf("Expected from quoted with '' escape, got: %s", result)
+	}
+	if count != 1 {
+		t.Errorf("Expected 1 fix, got %d", count)
+	}
+}
+
+func TestDisableFK(t *testing.T) {
+	input := "INSERT INTO tbl SET id='1',from=NULL;"
+	reader := strings.NewReader(input)
+	var buf bytes.Buffer
+	count, err := processSQL(reader, &buf, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := buf.String()
+
+	if !strings.HasPrefix(result, "SET FOREIGN_KEY_CHECKS=0;\n") {
+		t.Errorf("Expected FK disable at start, got: %s", result[:50])
+	}
+	if !strings.HasSuffix(result, "SET FOREIGN_KEY_CHECKS=1;\n") {
+		t.Errorf("Expected FK enable at end, got: %s", result[len(result)-50:])
 	}
 	if count != 1 {
 		t.Errorf("Expected 1 fix, got %d", count)
