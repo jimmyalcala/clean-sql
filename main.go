@@ -214,10 +214,11 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 	fixCount := 0
 
 	// State
-	inString := false     // inside a single-quoted string
-	inSetClause := false  // inside a SET column=value list
-	expectCol := false    // next identifier should be treated as a column name
-	afterComma := false   // just saw a comma outside a string in SET context
+	inString := false      // inside a single-quoted string
+	inInsert := false      // seen INSERT keyword, waiting for SET
+	inSetClause := false   // inside a SET column=value list
+	expectCol := false     // next identifier should be treated as a column name
+	afterComma := false    // just saw a comma outside a string in SET context
 
 	// Buffer for accumulating potential identifiers
 	var identBuf []byte
@@ -240,12 +241,14 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 			}
 		}
 
-		// Check if this is the SET keyword (outside strings)
-		if !inString && strings.EqualFold(word, "SET") {
-			// We only care about SET in INSERT context.
-			// A simple heuristic: if we see SET, start tracking columns.
-			inSetClause = true
-			expectCol = true
+		if !inString {
+			upperWord := strings.ToUpper(word)
+			if upperWord == "INSERT" {
+				inInsert = true
+			} else if upperWord == "SET" && inInsert {
+				inSetClause = true
+				expectCol = true
+			}
 		}
 
 		bw.WriteString(word)
@@ -306,6 +309,33 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 					// Put back the byte we peeked
 					br.UnreadByte()
 				}
+			} else if b == '\n' {
+				// Literal newline inside string — escape it so mysql client
+				// doesn't lose track of string boundaries across lines
+				bw.WriteByte('\\')
+				bw.WriteByte('n')
+				fixCount++
+			} else if b == '\r' {
+				// Carriage return inside string — escape it
+				// Check for \r\n sequence
+				next, err := br.ReadByte()
+				if err == nil && next == '\n' {
+					bw.WriteByte('\\')
+					bw.WriteByte('r')
+					bw.WriteByte('\\')
+					bw.WriteByte('n')
+				} else {
+					bw.WriteByte('\\')
+					bw.WriteByte('r')
+					if err == nil {
+						br.UnreadByte()
+					}
+				}
+				fixCount++
+			} else if b == '\t' {
+				// Tab inside string — escape it for safety
+				bw.WriteByte('\\')
+				bw.WriteByte('t')
 			} else {
 				bw.WriteByte(b)
 			}
@@ -343,6 +373,7 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 		case ';':
 			// End of statement — reset state
 			bw.WriteByte(b)
+			inInsert = false
 			inSetClause = false
 			expectCol = false
 			afterComma = false
@@ -380,12 +411,12 @@ which commonly cause ERROR 1064 syntax errors during import.
 Usage:
   clean-sql <input.sql>                  Fix and write to <input>_clean.sql
   clean-sql <input.sql> -o <output.sql>  Fix and write to specified output
-  clean-sql <input.sql> -i               Fix the file in-place
   clean-sql --check <input.sql>          Check only, report issues (no changes)
+
+The original file is NEVER modified. Output always goes to a new file.
 
 Options:
   -o <file>      Output file path
-  -i             Edit file in-place (overwrites original)
   --disable-fk   Wrap output with SET FOREIGN_KEY_CHECKS=0/1
   --check        Dry run: report number of fixes needed without writing
   --update       Self-update to the latest release
@@ -394,7 +425,7 @@ Options:
 
 Examples:
   clean-sql db-backup.sql
-  clean-sql db-backup.sql -i
+  clean-sql db-backup.sql --disable-fk
   clean-sql db-backup.sql -o fixed.sql
   cat dump.sql | clean-sql - > fixed.sql
 `, version)
@@ -410,7 +441,6 @@ func main() {
 
 	var inputFile string
 	var outputFile string
-	var inPlace bool
 	var checkOnly bool
 	var disableFK bool
 
@@ -434,7 +464,9 @@ func main() {
 			i++
 			outputFile = args[i]
 		case "-i":
-			inPlace = true
+			fmt.Fprintln(os.Stderr, "Error: -i (in-place) is no longer supported to protect original files.")
+			fmt.Fprintln(os.Stderr, "Use: clean-sql <input.sql> — output goes to <input>_clean.sql")
+			os.Exit(1)
 		case "--check":
 			checkOnly = true
 		case "--disable-fk":
@@ -467,9 +499,7 @@ func main() {
 	}
 
 	// Determine output path
-	if inPlace {
-		outputFile = inputFile
-	} else if outputFile == "" && !checkOnly {
+	if outputFile == "" && !checkOnly {
 		ext := ""
 		base := inputFile
 		if idx := strings.LastIndex(inputFile, "."); idx >= 0 {
@@ -501,21 +531,10 @@ func main() {
 		os.Exit(0)
 	}
 
-	// For in-place, write to temp file then rename
-	var outFile *os.File
-	if inPlace {
-		outFile, err = os.CreateTemp("", "clean-sql-*.sql")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating temp file: %v\n", err)
-			os.Exit(1)
-		}
-		defer os.Remove(outFile.Name())
-	} else {
-		outFile, err = os.Create(outputFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating output: %v\n", err)
-			os.Exit(1)
-		}
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating output: %v\n", err)
+		os.Exit(1)
 	}
 
 	fixCount, err := processSQL(inFile, outFile, disableFK)
@@ -527,18 +546,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	if inPlace {
-		if err := copyFile(outFile.Name(), inputFile); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing in-place: %v\n", err)
-			os.Exit(1)
-		}
-		os.Remove(outFile.Name())
-	}
-
-	fmt.Fprintf(os.Stderr, "Fixed %d reserved word column names\n", fixCount)
-	if !inPlace {
-		fmt.Fprintf(os.Stderr, "Output written to: %s\n", outputFile)
-	}
+	fmt.Fprintf(os.Stderr, "Fixed %d issues\n", fixCount)
+	fmt.Fprintf(os.Stderr, "Output written to: %s\n", outputFile)
+	fmt.Fprintf(os.Stderr, "Original file unchanged: %s\n", inputFile)
 }
 
 func copyFile(src, dst string) error {

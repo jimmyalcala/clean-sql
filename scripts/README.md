@@ -4,9 +4,9 @@ A wrapper script that combines `clean-sql`, MySQL import, and file cleanup into 
 
 ## What It Does
 
-1. Runs `clean-sql` on the SQL dump file to fix reserved word issues
+1. Runs `clean-sql` on the SQL dump file to fix reserved words, newlines in strings, and foreign key issues
 2. Imports the cleaned file into MySQL/MariaDB
-3. Moves both the original and cleaned files to a `restored_sql/` folder
+3. Moves both the original and cleaned files to a `restored_sql/` folder (original is never modified)
 
 ## Install
 

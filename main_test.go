@@ -129,15 +129,50 @@ func TestAlreadyQuoted(t *testing.T) {
 }
 
 func TestMultiLineInsert(t *testing.T) {
-	// This is the critical test — INSERT with HTML body spanning multiple lines
+	// INSERT with HTML body spanning multiple lines — newlines inside strings get escaped
 	input := "INSERT IGNORE INTO email_custom SET id='1',body='<html>\n<body>\n<p>Hello</p>\n</body>\n</html>',from=NULL,attachments=NULL;"
 	result, count := runProcess(t, input)
 
 	if !strings.Contains(result, "`from`=NULL") {
 		t.Errorf("Expected from quoted in multi-line insert, got: %s", result)
 	}
+	// 4 newlines escaped + 1 reserved word fix = 5
+	if count != 5 {
+		t.Errorf("Expected 5 fixes (4 newlines + 1 reserved word), got %d", count)
+	}
+	// Newlines inside strings should be escaped
+	if strings.Contains(result, "body='<html>\n") {
+		t.Error("Expected literal newlines inside strings to be escaped")
+	}
+	if !strings.Contains(result, `body='<html>\n<body>`) {
+		t.Errorf("Expected escaped newlines, got: %s", result)
+	}
+}
+
+func TestMultiLineNewlineEscape(t *testing.T) {
+	// Verify newlines in string values are escaped, but newlines outside strings are preserved
+	input := "INSERT INTO tbl SET body='line1\nline2\nline3',id='1';\nSELECT 1;\n"
+	result, count := runProcess(t, input)
+
+	// 2 newlines inside the string should be escaped
+	if count != 2 {
+		t.Errorf("Expected 2 fixes, got %d", count)
+	}
+	// The newline between statements should be preserved
+	if !strings.Contains(result, ";\nSELECT") {
+		t.Errorf("Newlines outside strings should be preserved, got: %s", result)
+	}
+}
+
+func TestCRLFInString(t *testing.T) {
+	input := "INSERT INTO tbl SET body='line1\r\nline2',id='1';"
+	result, count := runProcess(t, input)
+
 	if count != 1 {
 		t.Errorf("Expected 1 fix, got %d", count)
+	}
+	if !strings.Contains(result, `\r\n`) {
+		t.Errorf("Expected \\r\\n escape, got: %s", result)
 	}
 }
 

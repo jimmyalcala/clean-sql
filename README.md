@@ -7,6 +7,7 @@ Automatically fix errors when restoring MySQL/MariaDB SQL dump files. No more ma
 | Error | Code | Cause | Fix Applied |
 |-------|------|-------|-------------|
 | `You have an error in your SQL syntax` | ERROR 1064 (42000) | Reserved words (`from`, `key`, `order`, etc.) used as unquoted column names in `INSERT...SET` | Backtick-quotes the reserved word column names |
+| `Unknown command '\'` / `PAGER set to stdout` | mysql client error | Multi-line string values with literal newlines cause the mysql client to lose track of string boundaries | Escapes literal newlines inside strings as `\n` |
 | `Cannot delete or update a parent row: a foreign key constraint fails` | ERROR 1451 (23000) | `DELETE`/`UPDATE` blocked by foreign key references in child tables | Wraps SQL with `SET FOREIGN_KEY_CHECKS=0/1` (`--disable-fk`) |
 
 Have an error not listed here? [Open an issue](https://github.com/jimmyalcala/clean-sql/issues) and we'll add support for it.
@@ -83,14 +84,11 @@ sudo mv clean-sql-darwin-arm64 /usr/local/bin/clean-sql
 ## Usage
 
 ```bash
-# Fix and write to db-backup_clean.sql
+# Fix and write to db-backup_clean.sql (original is never modified)
 clean-sql db-backup.sql
 
 # Fix and write to a specific output file
 clean-sql db-backup.sql -o fixed.sql
-
-# Fix the file in-place (overwrites original)
-clean-sql db-backup.sql -i
 
 # Disable foreign key checks during import (fixes ERROR 1451)
 clean-sql db-backup.sql --disable-fk
@@ -105,12 +103,13 @@ cat dump.sql | clean-sql - > fixed.sql
 clean-sql --update
 ```
 
+The original file is **never modified**. Output always goes to a new `_clean.sql` file (or the path you specify with `-o`).
+
 ### Options
 
 | Flag | Description |
 |------|-------------|
 | `-o <file>` | Output file path |
-| `-i` | Edit file in-place (overwrites original) |
 | `--disable-fk` | Wrap output with `SET FOREIGN_KEY_CHECKS=0/1` to prevent foreign key errors |
 | `--check` | Dry run: report number of fixes needed without writing |
 | `--update` | Self-update to the latest release from GitHub |
@@ -148,17 +147,18 @@ The `--update` flag checks GitHub for the latest release, downloads the correct 
 
 ## How It Works
 
-`clean-sql` reads the SQL file as a byte stream using a state machine that:
+`clean-sql` reads the SQL file as a byte stream using a character-level state machine that:
 
 1. Tracks whether the current position is inside a single-quoted string literal
 2. Handles escape sequences (`\'` and `''`) correctly across line boundaries
-3. Detects `SET` keywords outside of strings to identify column assignment contexts
-4. Backtick-quotes column names that are MySQL/MariaDB reserved words
+3. Escapes literal newlines (`\n`, `\r\n`) inside string values so the mysql client doesn't lose track of string boundaries
+4. Detects `INSERT...SET` statements and backtick-quotes column names that are MySQL/MariaDB reserved words
 
 This means it correctly handles:
-- Multi-line `INSERT` statements (HTML email templates with newlines)
+- Multi-line `INSERT` statements (HTML email templates, BBCode content with newlines)
 - Escaped quotes inside string values
 - `from=` appearing inside string content (not touched)
+- `SET FOREIGN_KEY_CHECKS` and other non-INSERT `SET` statements (not touched)
 - Already backtick-quoted identifiers (not double-quoted)
 - Multiple statements in sequence
 
