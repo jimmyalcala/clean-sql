@@ -10,10 +10,11 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
-	version = "1.1.0"
+	version = "1.2.0"
 	repo    = "jimmyalcala/clean-sql"
 )
 
@@ -202,7 +203,62 @@ func isIdentChar(b byte) bool {
 // value's closing quote/NULL/number followed by a comma, the next identifier
 // before '=' is always a column name. We detect " SET " outside strings to enter
 // column-tracking mode, and track commas outside strings to find column names.
-func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error) {
+// looksLikeEndOfValue peeks ahead in the buffered reader to determine if we
+// just hit the end of a string value. After seeing \' we need to know if '
+// ended the string or was an escaped quote. We look for patterns that only
+// appear outside strings: ',column_name=' (SET clause) or ';' (end of statement).
+// All peeked bytes are unread so the reader position is unchanged.
+func looksLikeEndOfValue(br *bufio.Reader) bool {
+	peeked, _ := br.Peek(128)
+	if len(peeked) == 0 {
+		return true // EOF = end of value
+	}
+	i := 0
+	// Skip past any closing parens — these can appear inside string values
+	// (e.g. filter expressions like \'%hold\'em%\'))')
+	for i < len(peeked) && peeked[i] == ')' {
+		i++
+	}
+	if i >= len(peeked) {
+		return false
+	}
+	// We ONLY trust the ',column_name=' pattern as proof we're outside a string.
+	// Semicolons are NOT reliable — CSS inside HTML email templates has plenty
+	// of them (e.g. url(\'image.png\');\n). Even ';\n' appears in CSS.
+	if peeked[i] == ',' {
+		j := i + 1
+		// Skip spaces
+		for j < len(peeked) && peeked[j] == ' ' {
+			j++
+		}
+		// Read identifier (column name): letters, digits, underscores
+		identStart := j
+		hasUnderscore := false
+		for j < len(peeked) && isIdentChar(peeked[j]) {
+			if peeked[j] == '_' {
+				hasUnderscore = true
+			}
+			j++
+		}
+		// Require underscore in column name — SQL columns use snake_case
+		// (page_content, filter_id) while CSS properties use camelCase
+		// (GradientType, startColorstr). This avoids CSS false positives.
+		if j > identStart && hasUnderscore && j < len(peeked) && peeked[j] == '=' {
+			// Verify what comes after '=' looks like a SQL value start:
+			// ' (string), N (NULL), or digit. NOT \ (which is CSS like
+			// endColorstr=\'#fff\' inside gradient() functions).
+			if j+1 < len(peeked) {
+				after := peeked[j+1]
+				if after == '\'' || after == 'N' || (after >= '0' && after <= '9') || after == '-' {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func processSQL(reader io.Reader, writer io.Writer, disableFK bool, totalSize int64) (int, error) {
 	br := bufio.NewReaderSize(reader, 256*1024)
 	bw := bufio.NewWriterSize(writer, 256*1024)
 	defer bw.Flush()
@@ -212,6 +268,8 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 	}
 
 	fixCount := 0
+	bytesRead := int64(0)
+	lastProgress := time.Time{}
 
 	// State
 	inString := false      // inside a single-quoted string
@@ -261,6 +319,9 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 		b, err := br.ReadByte()
 		if err != nil {
 			flushIdent(0)
+			if totalSize > 0 {
+				fmt.Fprintf(os.Stderr, "\rProcessing: 100%% | %d fixes\n", fixCount)
+			}
 			if err == io.EOF {
 				if disableFK {
 					bw.WriteString("\nSET FOREIGN_KEY_CHECKS=1;\n")
@@ -268,6 +329,15 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 				return fixCount, nil
 			}
 			return fixCount, err
+		}
+
+		bytesRead++
+		if totalSize > 0 && time.Since(lastProgress) > 150*time.Millisecond {
+			pct := float64(bytesRead) / float64(totalSize) * 100
+			bar := int(pct / 2)
+			fmt.Fprintf(os.Stderr, "\rProcessing: %3.0f%% [%-50s] %s/%s | %d fixes",
+				pct, progressBar(bar), humanSize(bytesRead), humanSize(totalSize), fixCount)
+			lastProgress = time.Now()
 		}
 
 		if inString {
@@ -278,17 +348,66 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 				identBuf = identBuf[:0]
 			}
 
-			if b == '\\' {
+			if b == 0 {
+				// Null byte inside string — strip it
+				fixCount++
+				continue
+			} else if b == '\\' {
 				// Escaped character — write backslash and next char
-				bw.WriteByte(b)
 				next, err := br.ReadByte()
 				if err != nil {
+					bw.WriteByte(b)
 					if err == io.EOF {
 						return fixCount, nil
 					}
 					return fixCount, err
 				}
-				bw.WriteByte(next)
+				if next == '\\' {
+					// Double backslash — peek to see if followed by quote
+					peek, peekErr := br.ReadByte()
+					if peekErr == nil && peek == '\'' {
+						// \\' — check if this is a double-escaped quote
+						// by looking ahead for SET clause patterns
+						if looksLikeEndOfValue(br) {
+							// Legitimate escaped backslash followed by end of string
+							bw.WriteByte('\\')
+							bw.WriteByte('\\')
+							bw.WriteByte('\'')
+							inString = false
+						} else {
+							// Double-escaped quote — fix \\' to \'
+							bw.WriteByte('\\')
+							bw.WriteByte('\'')
+							fixCount++
+						}
+					} else {
+						// \\ not followed by quote — write both backslashes
+						bw.WriteByte('\\')
+						bw.WriteByte('\\')
+						if peekErr == nil {
+							br.UnreadByte()
+						}
+					}
+				} else if next == '\'' {
+					// \' — could be escaped quote OR trailing backslash + end of string
+					// To decide, peek further: if ',column_name=' or ';' follows, it's
+					// end of string. Otherwise it's a legitimate escaped quote.
+					if looksLikeEndOfValue(br) {
+						// Trailing backslash in value + end of string
+						bw.WriteByte('\\')
+						bw.WriteByte('\\')
+						bw.WriteByte('\'')
+						inString = false
+						fixCount++
+					} else {
+						// Genuine escaped quote — stay in string
+						bw.WriteByte(b)
+						bw.WriteByte(next)
+					}
+				} else {
+					bw.WriteByte(b)
+					bw.WriteByte(next)
+				}
 			} else if b == '\'' {
 				// Could be end of string or '' escape
 				bw.WriteByte(b)
@@ -343,6 +462,11 @@ func processSQL(reader io.Reader, writer io.Writer, disableFK bool) (int, error)
 		}
 
 		// Outside a string literal
+		if b == 0 {
+			// Null byte outside string — strip it
+			fixCount++
+			continue
+		}
 		if isIdentChar(b) {
 			identBuf = append(identBuf, b)
 			continue
@@ -489,7 +613,7 @@ func main() {
 
 	// Handle stdin
 	if inputFile == "-" {
-		fixCount, err := processSQL(os.Stdin, os.Stdout, disableFK)
+		fixCount, err := processSQL(os.Stdin, os.Stdout, disableFK, 0)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -518,7 +642,7 @@ func main() {
 	defer inFile.Close()
 
 	if checkOnly {
-		fixCount, err := processSQL(inFile, io.Discard, false)
+		fixCount, err := processSQL(inFile, io.Discard, false, 0)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -537,7 +661,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	fixCount, err := processSQL(inFile, outFile, disableFK)
+	// Get file size for progress bar
+	fileInfo, _ := inFile.Stat()
+	fileSize := int64(0)
+	if fileInfo != nil {
+		fileSize = fileInfo.Size()
+	}
+
+	fixCount, err := processSQL(inFile, outFile, disableFK, fileSize)
 	outFile.Close()
 	inFile.Close()
 
@@ -549,6 +680,26 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Fixed %d issues\n", fixCount)
 	fmt.Fprintf(os.Stderr, "Output written to: %s\n", outputFile)
 	fmt.Fprintf(os.Stderr, "Original file unchanged: %s\n", inputFile)
+}
+
+func progressBar(filled int) string {
+	if filled > 50 {
+		filled = 50
+	}
+	return strings.Repeat("=", filled) + strings.Repeat(" ", 50-filled)
+}
+
+func humanSize(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1fGB", float64(b)/float64(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(b)/float64(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(b)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%dB", b)
+	}
 }
 
 func copyFile(src, dst string) error {

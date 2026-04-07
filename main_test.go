@@ -10,7 +10,7 @@ func runProcess(t *testing.T, input string) (string, int) {
 	t.Helper()
 	reader := strings.NewReader(input)
 	var buf bytes.Buffer
-	count, err := processSQL(reader, &buf, false)
+	count, err := processSQL(reader, &buf, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestDisableFK(t *testing.T) {
 	input := "INSERT INTO tbl SET id='1',from=NULL;"
 	reader := strings.NewReader(input)
 	var buf bytes.Buffer
-	count, err := processSQL(reader, &buf, true)
+	count, err := processSQL(reader, &buf, true, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
